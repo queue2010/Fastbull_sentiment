@@ -1,6 +1,4 @@
-Here is the complete Python application (`fastbull_app.py`) adapted to scrape speculative sentiment directly from FastBull while keeping your full 28-pair matrix engine, MongoDB baseline persistence, session tracking, and Chart.js trendline visualizations.
 
-```python
 import os
 import datetime
 import time
