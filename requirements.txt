@@ -2,3 +2,4 @@ Flask
 pymongo
 playwright
 gunicorn
+tzdata
