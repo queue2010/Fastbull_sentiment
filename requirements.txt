@@ -1,5 +1,5 @@
 Flask
 pymongo
-playwright
+playwright==1.45.0
 gunicorn
 tzdata
