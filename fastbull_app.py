@@ -1,4 +1,3 @@
-
 import os
 import datetime
 import time
@@ -111,7 +110,6 @@ def fetch_fastbull_client_sentiment():
                 content_type = response.headers.get("content-type", "")
                 if "json" in content_type:
                     data = response.json()
-                    # Flatten/search dict or list structure for symbol sentiment entries
                     items = data.get("data", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
                     for item in items:
                         if isinstance(item, dict):
@@ -166,7 +164,6 @@ def fetch_fastbull_client_sentiment():
 
                     results = parse_sentiment_text(combined_text)
                     if results:
-                        # Merge intercepted data with scraped text results
                         merged = {**results, **extracted_api_data}
                         print(f"FastBull Scrape Success: Parsed {len(merged)} distinct symbols on attempt {attempt + 1}.")
                         return merged
@@ -240,60 +237,67 @@ def record_chart_snapshot(symbols, current_session_label, current_date_str, ny_n
 
 # --- BACKGROUND SCHEDULER WORKER ---
 def run_background_state_scheduler():
+    last_run_slot = None
     while True:
         try:
             ny_now = get_ny_time()
-            current_date_str = ny_now.strftime("%Y-%m-%d")
-            current_session_label, session_anchor_hour = get_current_session_details(ny_now)
+            current_slot = f"{ny_now.strftime('%Y-%m-%d-%H')}-{ny_now.minute}"
 
-            weekday = ny_now.weekday()
-            market_closed_weekend = (
-                weekday == 5 or
-                (weekday == 4 and ny_now.hour >= 17) or
-                (weekday == 6 and ny_now.hour < 17)
-            )
+            # Run exactly at 1 minute past every 10-minute interval (:01, :11, :21, :31, :41, :51)
+            if ny_now.minute % 10 == 1 and current_slot != last_run_slot:
+                last_run_slot = current_slot
+                current_date_str = ny_now.strftime("%Y-%m-%d")
+                current_session_label, session_anchor_hour = get_current_session_details(ny_now)
 
-            if market_closed_weekend:
-                symbols = None
-                print("Weekend pause: Forex market closed, skipping scrape cycle.")
-            else:
-                symbols = fetch_fastbull_client_sentiment()
+                weekday = ny_now.weekday()
+                market_closed_weekend = (
+                    weekday == 5 or
+                    (weekday == 4 and ny_now.hour >= 17) or
+                    (weekday == 6 and ny_now.hour < 17)
+                )
 
-            if symbols:
-                save_db_document(cache_collection, {
-                    "last_fetch_time": ny_now.strftime("%Y-%m-%d %H:%M:%S"),
-                    "live_pairs": symbols
-                }, "state_doc")
+                if market_closed_weekend:
+                    symbols = None
+                    print("Weekend pause: Forex market closed, skipping scrape cycle.")
+                else:
+                    symbols = fetch_fastbull_client_sentiment()
 
-            stored_baseline = load_db_document(baseline_collection)
-            session_did_change = (
-                stored_baseline.get("active_session") != current_session_label or
-                (stored_baseline.get("baseline_date") != current_date_str and current_session_label == "ASIA")
-            )
-            if symbols and session_did_change:
-                save_db_document(baseline_collection, {
-                    "baseline_date": current_date_str,
-                    "active_session": current_session_label,
-                    "anchor_hour": session_anchor_hour,
-                    "volumes": symbols
-                }, "state_doc")
+                if symbols:
+                    save_db_document(cache_collection, {
+                        "last_fetch_time": ny_now.strftime("%Y-%m-%d %H:%M:%S"),
+                        "live_pairs": symbols
+                    }, "state_doc")
 
-            stored_daily_baseline = load_db_document(daily_baseline_collection, "daily_state_doc")
-            current_daily_anchor_date = ny_now.strftime("%Y-%m-%d") if ny_now.hour >= 17 else (ny_now - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+                stored_baseline = load_db_document(baseline_collection)
+                session_did_change = (
+                    stored_baseline.get("active_session") != current_session_label or
+                    (stored_baseline.get("baseline_date") != current_date_str and current_session_label == "ASIA")
+                )
+                if symbols and session_did_change:
+                    save_db_document(baseline_collection, {
+                        "baseline_date": current_date_str,
+                        "active_session": current_session_label,
+                        "anchor_hour": session_anchor_hour,
+                        "volumes": symbols
+                    }, "state_doc")
 
-            if symbols and (not stored_daily_baseline or stored_daily_baseline.get("daily_anchor_date") != current_daily_anchor_date):
-                save_db_document(daily_baseline_collection, {
-                    "daily_anchor_date": current_daily_anchor_date,
-                    "volumes": symbols,
-                    "captured_at": ny_now.strftime("%Y-%m-%d %H:%M:%S")
-                }, "daily_state_doc")
+                stored_daily_baseline = load_db_document(daily_baseline_collection, "daily_state_doc")
+                current_daily_anchor_date = ny_now.strftime("%Y-%m-%d") if ny_now.hour >= 17 else (ny_now - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
 
-            if symbols:
-                record_chart_snapshot(symbols, current_session_label, current_date_str, ny_now)
+                if symbols and (not stored_daily_baseline or stored_daily_baseline.get("daily_anchor_date") != current_daily_anchor_date):
+                    save_db_document(daily_baseline_collection, {
+                        "daily_anchor_date": current_daily_anchor_date,
+                        "volumes": symbols,
+                        "captured_at": ny_now.strftime("%Y-%m-%d %H:%M:%S")
+                    }, "daily_state_doc")
+
+                if symbols:
+                    record_chart_snapshot(symbols, current_session_label, current_date_str, ny_now)
 
         except Exception as e:
             print(f"Scheduler Loop Error: {str(e)}")
-        time.sleep(60)
+        
+        time.sleep(20)
 
 # --- THREAD CONTROL & LOCK ---
 background_engine_thread = None
@@ -587,5 +591,3 @@ def index():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
-
-
