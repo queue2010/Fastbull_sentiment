@@ -23,19 +23,9 @@ daily_baseline_collection = db["daily_baselines"]
 cache_collection = db["api_cache"]
 chart_history_collection = db["session_chart_history"]
 
-# --- FULL 28-PAIR MATRIX + GOLD SYMBOL LIST ---
+# --- MAJOR PAIRS + GOLD SYMBOL LIST ---
 FASTBULL_SYMBOLS = [
-    # Majors (7)
-    "EURUSD", "GBPUSD", "AUDUSD", "NZDUSD", "USDCHF", "USDCAD", "USDJPY",
-    # Crosses (21)
-    "EURGBP", "EURAUD", "EURNZD", "EURCAD", "EURCHF", "EURJPY",
-    "GBPAUD", "GBPNZD", "GBPCAD", "GBPCHF", "GBPJPY",
-    "AUDCAD", "AUDCHF", "AUDJPY", "AUDNZD",
-    "NZDCAD", "NZDCHF", "NZDJPY",
-    "CADCHF", "CADJPY",
-    "CHFJPY",
-    # Gold
-    "XAUUSD"
+    "EURUSD", "GBPUSD", "AUDUSD", "NZDUSD", "USDCAD", "USDCHF", "USDJPY", "XAUUSD"
 ]
 
 def clean_symbol_key(key_str):
@@ -75,10 +65,7 @@ def get_current_session_details(ny_dt):
         return "ASIA", 18
 
 def parse_sentiment_text(text):
-    """
-    Parses full page text using regex to find Long % for each symbol.
-    FastBull typically displays pairs as EUR/USD, GBP/USD, XAU/USD or EURUSD.
-    """
+    """Parses full page text using regex to find Long % for major pairs + Gold."""
     results = {}
     for sym in FASTBULL_SYMBOLS:
         std_key = sym.upper()
@@ -97,10 +84,10 @@ def parse_sentiment_text(text):
 
 def fetch_fastbull_client_sentiment():
     """
-    Renders FastBull speculative sentiment page using Playwright. Intercepts JSON
-    API responses and falls back to rendering DOM elements across all frames.
+    Renders FastBull major sentiment page using Playwright.
+    Target URL: https://www.fastbull.com/speculative-sentiment?textType=1&id=1
     """
-    url = "https://www.fastbull.com/speculative-sentiment"
+    url = "https://www.fastbull.com/speculative-sentiment?textType=1&id=1"
     extracted_api_data = {}
 
     def handle_response(response):
@@ -149,7 +136,7 @@ def fetch_fastbull_client_sentiment():
                 for attempt in range(6):
                     page.wait_for_timeout(3000)
                     
-                    if len(extracted_api_data) >= 15:
+                    if len(extracted_api_data) >= 7:
                         print(f"FastBull API Intercept Success: Captured {len(extracted_api_data)} symbols via network listener.")
                         return extracted_api_data
 
@@ -176,6 +163,99 @@ def fetch_fastbull_client_sentiment():
         print(f"FastBull Playwright Exception: {str(e)}")
         return None
 
+def extract_pair_values(pair_dict, sym):
+    """Safely retrieves long and short percentages for a symbol from DB/scraped dicts."""
+    val = pair_dict.get(sym) or pair_dict.get(sym.upper()) or {}
+    l_long = float(val.get("long", val.get("longVolume", 50.0)))
+    l_short = float(val.get("short", val.get("shortVolume", 50.0)))
+    if l_long + l_short == 0:
+        l_long, l_short = 50.0, 50.0
+    return l_long, l_short
+
+def calculate_inventory(pairs_dict):
+    """
+    Computes absolute retail positioning long %:
+    - Base majors (EUR, GBP, AUD, NZD) take their direct major pair long %
+    - Quote majors (CAD, CHF, JPY) flip side: taking pair short %
+    - USD takes average of USD long % across all 7 major pairs
+    - Gold takes XAUUSD long %
+    """
+    inv = {}
+    e_l, _ = extract_pair_values(pairs_dict, "EURUSD")
+    g_l, _ = extract_pair_values(pairs_dict, "GBPUSD")
+    a_l, _ = extract_pair_values(pairs_dict, "AUDUSD")
+    n_l, _ = extract_pair_values(pairs_dict, "NZDUSD")
+    
+    _, c_s = extract_pair_values(pairs_dict, "USDCAD")
+    _, ch_s = extract_pair_values(pairs_dict, "USDCHF")
+    _, j_s = extract_pair_values(pairs_dict, "USDJPY")
+    
+    x_l, _ = extract_pair_values(pairs_dict, "XAUUSD")
+
+    # USD Long % across all 7 pairs
+    _, e_s = extract_pair_values(pairs_dict, "EURUSD")
+    _, g_s = extract_pair_values(pairs_dict, "GBPUSD")
+    _, a_s = extract_pair_values(pairs_dict, "AUDUSD")
+    _, n_s = extract_pair_values(pairs_dict, "NZDUSD")
+    uc_l, _ = extract_pair_values(pairs_dict, "USDCAD")
+    uch_l, _ = extract_pair_values(pairs_dict, "USDCHF")
+    uj_l, _ = extract_pair_values(pairs_dict, "USDJPY")
+
+    usd_long_avg = (e_s + g_s + a_s + n_s + uc_l + uch_l + uj_l) / 7.0
+
+    inv["EUR"] = e_l / 100.0
+    inv["GBP"] = g_l / 100.0
+    inv["AUD"] = a_l / 100.0
+    inv["NZD"] = n_l / 100.0
+    inv["CAD"] = c_s / 100.0
+    inv["CHF"] = ch_s / 100.0
+    inv["JPY"] = j_s / 100.0
+    inv["GOLD"] = x_l / 100.0
+    inv["USD"] = usd_long_avg / 100.0
+    return inv
+
+def calculate_deltas(live_dict, base_dict):
+    """
+    Computes value shift deltas for active session and 24h baseline comparisons.
+    USD deltas are averaged across the 7 major pairs to keep scale identical to individual currencies.
+    """
+    tracked_assets = ["EUR", "GBP", "USD", "AUD", "NZD", "CAD", "CHF", "JPY", "GOLD"]
+    sess_long_delta = {a: 0.0 for a in tracked_assets}
+    sess_short_delta = {a: 0.0 for a in tracked_assets}
+    
+    usd_pairs_count = 0
+    for sym in FASTBULL_SYMBOLS:
+        l_l, l_s = extract_pair_values(live_dict, sym)
+        b_l, b_s = extract_pair_values(base_dict, sym)
+
+        dl = l_l - b_l
+        ds = l_s - b_s
+
+        clean_sym = clean_symbol_key(sym).upper()
+        if clean_sym == "XAUUSD":
+            sess_long_delta["GOLD"] += dl
+            sess_short_delta["GOLD"] += ds
+        elif clean_sym in ["EURUSD", "GBPUSD", "AUDUSD", "NZDUSD"]:
+            base_cur = clean_sym[:3]
+            sess_long_delta[base_cur] += dl
+            sess_short_delta[base_cur] += ds
+            sess_long_delta["USD"] += ds
+            sess_short_delta["USD"] += dl
+            usd_pairs_count += 1
+        elif clean_sym in ["USDCAD", "USDCHF", "USDJPY"]:
+            quote_cur = clean_sym[3:]
+            sess_long_delta["USD"] += dl
+            sess_short_delta["USD"] += ds
+            sess_long_delta[quote_cur] += ds
+            sess_short_delta[quote_cur] += dl
+            usd_pairs_count += 1
+
+    if usd_pairs_count > 0:
+        sess_long_delta["USD"] /= usd_pairs_count
+        sess_short_delta["USD"] /= usd_pairs_count
+
+    return sess_long_delta, sess_short_delta
+
 def record_chart_snapshot(symbols, current_session_label, current_date_str, ny_now):
     """Computes combined session + daily deltas for trend charting."""
     try:
@@ -184,37 +264,10 @@ def record_chart_snapshot(symbols, current_session_label, current_date_str, ny_n
         stored_daily_baseline = load_db_document(daily_baseline_collection, "daily_state_doc")
         daily_baseline_volumes = stored_daily_baseline.get("volumes", {})
 
-        majors = ["EUR", "GBP", "USD", "AUD", "NZD", "CAD", "CHF", "JPY"]
-        tracked_assets = majors + ["GOLD"]
+        tracked_assets = ["EUR", "GBP", "USD", "AUD", "NZD", "CAD", "CHF", "JPY", "GOLD"]
 
-        sess_long_delta, sess_short_delta = {a: 0.0 for a in tracked_assets}, {a: 0.0 for a in tracked_assets}
-        daily_long_delta, daily_short_delta = {a: 0.0 for a in tracked_assets}, {a: 0.0 for a in tracked_assets}
-
-        for name, live in symbols.items():
-            cleaned_name = clean_symbol_key(name)
-            l_long, l_short = float(live.get("long", 0)), float(live.get("short", 0))
-
-            b_val = baseline_volumes.get(name, {})
-            d_val = daily_baseline_volumes.get(name, {})
-            b_long = get_safe_volume(b_val, "long", "longVolume", l_long)
-            b_short = get_safe_volume(b_val, "short", "shortVolume", l_short)
-            d_long = get_safe_volume(d_val, "longVolume", "long", l_long)
-            d_short = get_safe_volume(d_val, "shortVolume", "short", l_short)
-
-            if cleaned_name == "xauusd":
-                sess_long_delta["GOLD"] = (l_long - b_long)
-                sess_short_delta["GOLD"] = (l_short - b_short)
-                daily_long_delta["GOLD"] = (l_long - d_long)
-                daily_short_delta["GOLD"] = (l_short - d_short)
-                continue
-
-            if len(cleaned_name) != 6: continue
-            base, quote = cleaned_name[0:3].upper(), cleaned_name[3:6].upper()
-            if base in majors and quote in majors:
-                sess_long_delta[base] += (l_long - b_long); sess_short_delta[base] += (l_short - b_short)
-                sess_long_delta[quote] += (l_short - b_short); sess_short_delta[quote] += (l_long - b_long)
-                daily_long_delta[base] += (l_long - d_long); daily_short_delta[base] += (l_short - d_short)
-                daily_long_delta[quote] += (l_short - d_short); daily_short_delta[quote] += (l_long - d_long)
+        sess_long_delta, sess_short_delta = calculate_deltas(symbols, baseline_volumes)
+        daily_long_delta, daily_short_delta = calculate_deltas(symbols, daily_baseline_volumes)
 
         stored_chart = load_db_document(chart_history_collection, "chart_state_doc")
         points = stored_chart.get("points", {}) if stored_chart.get("session") == current_session_label else {}
@@ -326,56 +379,16 @@ def process_sentiment_matrix():
     stored_daily_baseline = load_db_document(daily_baseline_collection, "daily_state_doc")
     daily_baseline_volumes = stored_daily_baseline.get("volumes", {})
 
-    majors = ["EUR", "GBP", "USD", "AUD", "NZD", "CAD", "CHF", "JPY"]
-    tracked_assets = majors + ["GOLD"]
+    tracked_assets = ["EUR", "GBP", "USD", "AUD", "NZD", "CAD", "CHF", "JPY", "GOLD"]
 
-    abs_long_pct_sum = {asset: 0.0 for asset in tracked_assets}
-    abs_pair_counts = {asset: 0 for asset in tracked_assets}
-    sess_long_delta, sess_short_delta = {a: 0.0 for a in tracked_assets}, {a: 0.0 for a in tracked_assets}
-    daily_long_delta, daily_short_delta = {a: 0.0 for a in tracked_assets}, {a: 0.0 for a in tracked_assets}
-
-    for name, live in live_pairs.items():
-        cleaned_name = clean_symbol_key(name)
-        l_long, l_short = float(live.get("long", 0)), float(live.get("short", 0))
-        total_live = l_long + l_short
-
-        b_val = baseline_volumes.get(name, {})
-        d_val = daily_baseline_volumes.get(name, {})
-
-        b_long = get_safe_volume(b_val, "long", "longVolume", l_long)
-        b_short = get_safe_volume(b_val, "short", "shortVolume", l_short)
-
-        d_long = get_safe_volume(d_val, "longVolume", "long", l_long)
-        d_short = get_safe_volume(d_val, "shortVolume", "short", l_short)
-
-        if cleaned_name == "xauusd":
-            if total_live > 0: abs_long_pct_sum["GOLD"] = (l_long / total_live)
-            abs_pair_counts["GOLD"] = 1
-            sess_long_delta["GOLD"] = (l_long - b_long)
-            sess_short_delta["GOLD"] = (l_short - b_short)
-            daily_long_delta["GOLD"] = (l_long - d_long)
-            daily_short_delta["GOLD"] = (l_short - d_short)
-            continue
-
-        if len(cleaned_name) != 6: continue
-        base, quote = cleaned_name[0:3].upper(), cleaned_name[3:6].upper()
-
-        if base in majors and quote in majors:
-            if total_live > 0:
-                abs_long_pct_sum[base] += (l_long / total_live); abs_pair_counts[base] += 1
-                abs_long_pct_sum[quote] += (l_short / total_live); abs_pair_counts[quote] += 1
-
-            sess_long_delta[base] += (l_long - b_long); sess_short_delta[base] += (l_short - b_short)
-            sess_long_delta[quote] += (l_short - b_short); sess_short_delta[quote] += (l_long - b_long)
-
-            daily_long_delta[base] += (l_long - d_long); daily_short_delta[base] += (l_short - d_short)
-            daily_long_delta[quote] += (l_short - d_short); daily_short_delta[quote] += (l_long - d_long)
+    inv_ratios = calculate_inventory(live_pairs)
+    sess_long_delta, sess_short_delta = calculate_deltas(live_pairs, baseline_volumes)
+    daily_long_delta, daily_short_delta = calculate_deltas(live_pairs, daily_baseline_volumes)
 
     currency_scores, daily_currency_scores, combined_currency_scores, bias_output = {}, {}, {}, []
 
     for cur in tracked_assets:
-        count = abs_pair_counts[cur]
-        inv_long_ratio = (abs_long_pct_sum[cur] / count) if count > 0 else 0.5
+        inv_long_ratio = inv_ratios.get(cur, 0.5)
         display_name = "Gold" if cur == "GOLD" else cur
         bias_output.append({"currency": display_name, "long_pct": round(inv_long_ratio * 100, 1), "bias_label": "BULLISH" if inv_long_ratio >= 0.5 else "BEARISH"})
 
