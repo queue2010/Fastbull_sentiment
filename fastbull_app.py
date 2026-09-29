@@ -1,6 +1,4 @@
-Here is the updated `fastbull_app.py` with the 10-minute optimized background scheduler:
 
-```python
 import os
 import datetime
 import time
