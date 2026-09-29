@@ -85,7 +85,7 @@ def parse_sentiment_text(text):
 def fetch_fastbull_client_sentiment():
     """
     Renders FastBull major sentiment page using Playwright.
-    Target URL: https://www.fastbull.com/speculative-sentiment?textType=1&id=1
+    Target URL: https://www.fastbull.com/speculative-sentiment?textType=1&id=5
     """
     url = "https://www.fastbull.com/speculative-sentiment?textType=1&id=1"
     extracted_api_data = {}
