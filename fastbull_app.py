@@ -100,7 +100,7 @@ def fetch_fastbull_client_sentiment():
     Renders FastBull speculative sentiment page using Playwright. Intercepts JSON
     API responses and falls back to rendering DOM elements across all frames.
     """
-    url = "https://www.fastbull.com/speculative-sentiment?textType=1&id=5"
+    url = "https://fxssi.com/tools/current-ratio?filter=xm"
     extracted_api_data = {}
 
     def handle_response(response):
