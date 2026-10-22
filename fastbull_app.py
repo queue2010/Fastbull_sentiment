@@ -76,8 +76,7 @@ def get_current_session_details(ny_dt):
 
 def parse_sentiment_text(text):
     """
-    Parses full page text using regex to find Long % for each symbol.
-    FastBull typically displays pairs as EUR/USD, GBP/USD, XAU/USD or EURUSD.
+    Parses text looking for symbol names and percentage values across expanded DOM containers.
     """
     results = {}
     for sym in FASTBULL_SYMBOLS:
@@ -88,7 +87,7 @@ def parse_sentiment_text(text):
         else:
             pair_regex = clean_key
             
-        pattern = rf'{pair_regex}[\s\S]{{0,150}}?(\d+(?:\.\d+)?)%'
+        pattern = rf'{pair_regex}[\s\S]{{0,250}}?(\d+(?:\.\d+)?)%'
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
             long_pct = float(match.group(1))
@@ -97,24 +96,34 @@ def parse_sentiment_text(text):
 
 def fetch_fastbull_client_sentiment():
     """
-    Renders FastBull speculative sentiment page using Playwright. Intercepts JSON
-    API responses and falls back to rendering DOM elements across all frames.
+    Renders FastBull speculative sentiment page using Playwright.
+    Target URL: https://www.fastbull.com/speculative-sentiment?textType=1&id=-1
+    Intercepts network requests to extract raw API JSON directly.
     """
     url = "https://www.fastbull.com/speculative-sentiment?textType=1&id=-1"
     extracted_api_data = {}
 
     def handle_response(response):
-        """Intercepts internal FastBull sentiment API calls if available."""
+        """Intercepts FastBull internal backend API payloads."""
         try:
-            if "sentiment" in response.url.lower() and response.status == 200:
+            if any(k in response.url.lower() for k in ["sentiment", "speculative"]) and response.status == 200:
                 content_type = response.headers.get("content-type", "")
                 if "json" in content_type:
                     data = response.json()
-                    items = data.get("data", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                    
+                    items = []
+                    if isinstance(data, dict):
+                        items = data.get("data", []) or data.get("list", []) or data.get("result", [])
+                    elif isinstance(data, list):
+                        items = data
+                        
+                    if isinstance(items, dict):
+                        items = items.get("list", []) or items.get("items", [])
+
                     for item in items:
                         if isinstance(item, dict):
-                            raw_symbol = item.get("symbol") or item.get("pair") or item.get("name", "")
-                            long_val = item.get("longRate") or item.get("longPercentage") or item.get("long", None)
+                            raw_symbol = item.get("symbol") or item.get("pair") or item.get("name") or item.get("symbolName", "")
+                            long_val = item.get("longRate") or item.get("longPercentage") or item.get("long") or item.get("longRatio", None)
                             if raw_symbol and long_val is not None:
                                 cleaned = clean_symbol_key(raw_symbol)
                                 for sym in FASTBULL_SYMBOLS:
@@ -137,20 +146,21 @@ def fetch_fastbull_client_sentiment():
                 page = browser.new_page(
                     user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
                 )
-                page.set_default_timeout(25000)
+                page.set_default_timeout(30000)
                 page.on("response", handle_response)
 
                 try:
-                    page.goto(url, wait_until="networkidle", timeout=30000)
+                    page.goto(url, wait_until="domcontentloaded", timeout=30000)
                 except Exception as nav_err:
-                    print(f"FastBull Navigation Warning: {str(nav_err)} -- inspecting DOM anyway")
+                    print(f"FastBull Navigation Warning: {str(nav_err)} -- inspecting page DOM anyway")
 
-                # Poll up to 6 times (18s total) to capture rendered components
-                for attempt in range(6):
-                    page.wait_for_timeout(3000)
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+
+                for attempt in range(8):
+                    page.wait_for_timeout(2500)
                     
                     if len(extracted_api_data) >= 15:
-                        print(f"FastBull API Intercept Success: Captured {len(extracted_api_data)} symbols via network listener.")
+                        print(f"FastBull Network Intercept Success: Captured {len(extracted_api_data)} symbols directly from API.")
                         return extracted_api_data
 
                     combined_text = ""
@@ -163,8 +173,9 @@ def fetch_fastbull_client_sentiment():
                             continue
 
                     results = parse_sentiment_text(combined_text)
-                    if results:
-                        merged = {**results, **extracted_api_data}
+                    merged = {**results, **extracted_api_data}
+                    
+                    if len(merged) >= 15:
                         print(f"FastBull Scrape Success: Parsed {len(merged)} distinct symbols on attempt {attempt + 1}.")
                         return merged
 
