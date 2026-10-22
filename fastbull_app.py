@@ -150,7 +150,6 @@ def fetch_fastbull_client_sentiment():
                 page.on("response", handle_response)
 
                 try:
-                    # FIX: Switch to domcontentloaded to prevent networkidle timeouts
                     page.goto(url, wait_until="domcontentloaded", timeout=30000)
                 except Exception as nav_err:
                     print(f"FastBull Navigation Warning: {str(nav_err)} -- inspecting page DOM anyway")
@@ -247,8 +246,67 @@ def record_chart_snapshot(symbols, current_session_label, current_date_str, ny_n
     except Exception as e:
         print(f"Chart Snapshot Error: {str(e)}")
 
+def execute_scrape_cycle():
+    """Performs a single complete scrape, database update, and baseline set."""
+    try:
+        ny_now = get_ny_time()
+        current_date_str = ny_now.strftime("%Y-%m-%d")
+        current_session_label, session_anchor_hour = get_current_session_details(ny_now)
+
+        weekday = ny_now.weekday()
+        market_closed_weekend = (
+            weekday == 5 or
+            (weekday == 4 and ny_now.hour >= 17) or
+            (weekday == 6 and ny_now.hour < 17)
+        )
+
+        if market_closed_weekend:
+            print("Weekend pause: Forex market closed, skipping scrape cycle.")
+            return None
+
+        symbols = fetch_fastbull_client_sentiment()
+
+        if symbols:
+            save_db_document(cache_collection, {
+                "last_fetch_time": ny_now.strftime("%Y-%m-%d %H:%M:%S"),
+                "live_pairs": symbols
+            }, "state_doc")
+
+            stored_baseline = load_db_document(baseline_collection)
+            session_did_change = (
+                stored_baseline.get("active_session") != current_session_label or
+                (stored_baseline.get("baseline_date") != current_date_str and current_session_label == "ASIA") or
+                not stored_baseline.get("volumes")
+            )
+            if session_did_change:
+                save_db_document(baseline_collection, {
+                    "baseline_date": current_date_str,
+                    "active_session": current_session_label,
+                    "anchor_hour": session_anchor_hour,
+                    "volumes": symbols
+                }, "state_doc")
+
+            stored_daily_baseline = load_db_document(daily_baseline_collection, "daily_state_doc")
+            current_daily_anchor_date = ny_now.strftime("%Y-%m-%d") if ny_now.hour >= 17 else (ny_now - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+
+            if not stored_daily_baseline or stored_daily_baseline.get("daily_anchor_date") != current_daily_anchor_date:
+                save_db_document(daily_baseline_collection, {
+                    "daily_anchor_date": current_daily_anchor_date,
+                    "volumes": symbols,
+                    "captured_at": ny_now.strftime("%Y-%m-%d %H:%M:%S")
+                }, "daily_state_doc")
+
+            record_chart_snapshot(symbols, current_session_label, current_date_str, ny_now)
+            return symbols
+    except Exception as e:
+        print(f"Scrape Cycle Execution Error: {str(e)}")
+        return None
+
 # --- BACKGROUND SCHEDULER WORKER ---
 def run_background_state_scheduler():
+    print("Executing immediate startup scrape cycle...")
+    execute_scrape_cycle()
+
     last_run_slot = None
     while True:
         try:
@@ -258,53 +316,7 @@ def run_background_state_scheduler():
             # Run exactly at 1 minute past every 10-minute interval (:01, :11, :21, :31, :41, :51)
             if ny_now.minute % 10 == 1 and current_slot != last_run_slot:
                 last_run_slot = current_slot
-                current_date_str = ny_now.strftime("%Y-%m-%d")
-                current_session_label, session_anchor_hour = get_current_session_details(ny_now)
-
-                weekday = ny_now.weekday()
-                market_closed_weekend = (
-                    weekday == 5 or
-                    (weekday == 4 and ny_now.hour >= 17) or
-                    (weekday == 6 and ny_now.hour < 17)
-                )
-
-                if market_closed_weekend:
-                    symbols = None
-                    print("Weekend pause: Forex market closed, skipping scrape cycle.")
-                else:
-                    symbols = fetch_fastbull_client_sentiment()
-
-                if symbols:
-                    save_db_document(cache_collection, {
-                        "last_fetch_time": ny_now.strftime("%Y-%m-%d %H:%M:%S"),
-                        "live_pairs": symbols
-                    }, "state_doc")
-
-                stored_baseline = load_db_document(baseline_collection)
-                session_did_change = (
-                    stored_baseline.get("active_session") != current_session_label or
-                    (stored_baseline.get("baseline_date") != current_date_str and current_session_label == "ASIA")
-                )
-                if symbols and session_did_change:
-                    save_db_document(baseline_collection, {
-                        "baseline_date": current_date_str,
-                        "active_session": current_session_label,
-                        "anchor_hour": session_anchor_hour,
-                        "volumes": symbols
-                    }, "state_doc")
-
-                stored_daily_baseline = load_db_document(daily_baseline_collection, "daily_state_doc")
-                current_daily_anchor_date = ny_now.strftime("%Y-%m-%d") if ny_now.hour >= 17 else (ny_now - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-
-                if symbols and (not stored_daily_baseline or stored_daily_baseline.get("daily_anchor_date") != current_daily_anchor_date):
-                    save_db_document(daily_baseline_collection, {
-                        "daily_anchor_date": current_daily_anchor_date,
-                        "volumes": symbols,
-                        "captured_at": ny_now.strftime("%Y-%m-%d %H:%M:%S")
-                    }, "daily_state_doc")
-
-                if symbols:
-                    record_chart_snapshot(symbols, current_session_label, current_date_str, ny_now)
+                execute_scrape_cycle()
 
         except Exception as e:
             print(f"Scheduler Loop Error: {str(e)}")
@@ -600,6 +612,19 @@ def index():
         return render_template_string(DASHBOARD_HTML, data=process_sentiment_matrix(), chart_history=chart_data)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@app.route('/force-scrape')
+def force_scrape():
+    """Debug route to manually trigger an immediate scrape from browser."""
+    symbols = execute_scrape_cycle()
+    if symbols:
+        return jsonify({
+            "status": "success",
+            "count": len(symbols),
+            "symbols": list(symbols.keys()),
+            "data": symbols
+        })
+    return jsonify({"status": "failed", "count": 0}), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
