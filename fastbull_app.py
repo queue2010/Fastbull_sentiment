@@ -150,6 +150,7 @@ def fetch_fastbull_client_sentiment():
                 page.on("response", handle_response)
 
                 try:
+                    # FIX: Switch to domcontentloaded to prevent networkidle timeouts
                     page.goto(url, wait_until="domcontentloaded", timeout=30000)
                 except Exception as nav_err:
                     print(f"FastBull Navigation Warning: {str(nav_err)} -- inspecting page DOM anyway")
