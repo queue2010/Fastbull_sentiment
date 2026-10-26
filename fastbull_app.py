@@ -39,8 +39,8 @@ lock_collection = db["scheduler_lock"]
 WORKER_MODE = "--scrape-worker" in sys.argv   # child process that only runs the browser scrape
 RESULT_MARKER = "__SCRAPE_RESULT__:"
 SLOT_MINUTE_OFFSET = 1        # scrape at :01, :11, :21, :31, :41, :51
-SCRAPE_TIMEOUT_SEC = 70       # hard kill limit for one browser scrape
-WORKER_DEADLINE_SEC = 50      # the browser worker stops polling by itself after this
+SCRAPE_TIMEOUT_SEC = 80       # hard kill limit for one browser scrape
+WORKER_DEADLINE_SEC = 60      # the browser worker stops polling by itself after this
 MAX_ATTEMPTS_PER_SLOT = 3     # retries inside a slot if FastBull returns nothing
 RETRY_DELAY_SEC = 5
 LEASE_TTL_SEC = 400           # cross-process lock; auto-expires if a holder dies
@@ -134,15 +134,70 @@ def parse_sentiment_text(text):
 BLOCKED_URL_PARTS = (
     "doubleclick", "googlesyndication", "google-analytics", "googletagmanager", "googleadservices",
     "adservice", "facebook.net", "facebook.com/tr", "hotjar", "clarity.ms", "taboola", "outbrain",
-    "criteo", "adsystem", "amazon-adsystem", "scorecardresearch",
+    "criteo", "adsystem", "amazon-adsystem", "scorecardresearch", "rumt-us.com",
 )
+
+SENSITIVE_HEADER_HINTS = ("cookie", "authorization", "token")
+
+def extract_pairs_from_json(node, out):
+    """
+    Walks ANY JSON structure and picks every object that names a known symbol and carries
+    long/short numbers. Safe by design: values are accepted only when long+short ~ 100
+    (or ~ 1 for fractions), or when the field is one of the legacy long-only percentage names.
+    """
+    if isinstance(node, list):
+        for x in node:
+            extract_pairs_from_json(x, out)
+        return
+    if not isinstance(node, dict):
+        return
+
+    sym_found = None
+    for v in node.values():
+        if isinstance(v, str):
+            cleaned = clean_symbol_key(v)
+            for sym in FASTBULL_SYMBOLS:
+                if clean_symbol_key(sym) == cleaned:
+                    sym_found = sym
+                    break
+        if sym_found:
+            break
+
+    if sym_found:
+        long_v = short_v = None
+        long_key = ""
+        for k, v in node.items():
+            if isinstance(v, bool) or not isinstance(v, (int, float, str)):
+                continue
+            try:
+                num = float(v)
+            except (TypeError, ValueError):
+                continue
+            kl = k.lower()
+            if long_v is None and any(h in kl for h in ("long", "buy", "bull")):
+                long_v, long_key = num, kl
+            elif short_v is None and any(h in kl for h in ("short", "sell", "bear")):
+                short_v = num
+        if long_v is not None and short_v is not None:
+            total = long_v + short_v
+            if abs(total - 1.0) < 0.02:
+                long_v, short_v, total = long_v * 100, short_v * 100, total * 100
+            if abs(total - 100.0) <= 1.5 and 0 <= long_v <= 100:
+                out[sym_found.upper()] = {"long": round(long_v, 1), "short": round(100.0 - long_v, 1)}
+        elif long_v is not None and short_v is None and long_key in ("longrate", "longpercentage", "longratio") and 0 <= long_v <= 100:
+            out[sym_found.upper()] = {"long": round(long_v, 1), "short": round(100.0 - long_v, 1)}
+        return
+
+    for v in node.values():
+        if isinstance(v, (list, dict)):
+            extract_pairs_from_json(v, out)
 
 def fetch_fastbull_client_sentiment():
     """
-    Renders FastBull speculative sentiment page using Playwright (runs inside the scrape-worker process).
-    Target URL: https://www.fastbull.com/speculative-sentiment?textType=1&id=-1
-    Intercepts network requests to extract raw API JSON directly, falls back to page text.
-    Every step is logged with elapsed time so a slow/hanging step is visible in /health.
+    Loads the FastBull speculative sentiment page (runs inside the scrape-worker process) and reads the
+    page's own data call (getSpeculativeEmotion) straight from the network traffic. It does NOT wait for
+    the page to finish rendering; the DOM text is only a late fallback.
+    Every step is logged with elapsed time so slow steps are visible in /health.
     """
     url = "https://www.fastbull.com/speculative-sentiment?textType=1&id=-1"
     extracted_api_data = {}
@@ -154,43 +209,59 @@ def fetch_fastbull_client_sentiment():
     def wlog(msg):
         print(f"[{time.time() - t0:5.1f}s] {msg}", flush=True)
 
+    def log_chunks(label, text, size=280, max_chunks=3):
+        text = text or ""
+        for i in range(0, min(len(text), size * max_chunks), size):
+            wlog(f"{label}: {text[i:i + size]}")
+
     def handle_response(response):
-        """Intercepts FastBull internal backend API payloads."""
+        """Reads FastBull's sentiment API payload straight from the network traffic."""
         try:
             net["responses"] += 1
             net["last_url"] = response.url[:150]
-            if any(k in response.url.lower() for k in ["sentiment", "speculative"]) and response.status == 200:
-                content_type = response.headers.get("content-type", "")
-                if "json" in content_type:
-                    if response.url not in logged_api:
-                        logged_api.add(response.url)
-                        wlog(f"API candidate: {response.url[:200]}")
-                    data = response.json()
+            ulow = response.url.lower()
+            if not any(k in ulow for k in ("speculative", "sentiment", "emotion")):
+                return
+            ctype = (response.headers.get("content-type", "") or "").lower()
+            rtype = response.request.resource_type
+            if rtype not in ("xhr", "fetch") and "json" not in ctype:
+                return
+            if response.status != 200:
+                wlog(f"API non-200: status={response.status} {response.url[:160]}")
+                return
 
-                    items = []
-                    if isinstance(data, dict):
-                        items = data.get("data", []) or data.get("list", []) or data.get("result", [])
-                    elif isinstance(data, list):
-                        items = data
+            body = response.text()
 
-                    if isinstance(items, dict):
-                        items = items.get("list", []) or items.get("items", [])
+            if response.url not in logged_api:
+                logged_api.add(response.url)
+                req = response.request
+                try:
+                    hdrs = {k: ("<redacted>" if any(h in k.lower() for h in SENSITIVE_HEADER_HINTS) else str(v)[:70])
+                            for k, v in req.headers.items()}
+                except Exception:
+                    hdrs = {}
+                try:
+                    post = (req.post_data or "")[:250]
+                except Exception:
+                    post = "<binary>"
+                wlog(f"API request: {req.method} {response.url[:250]}")
+                log_chunks("API request headers", json.dumps(hdrs), max_chunks=2)
+                wlog(f"API request post_data: {post}")
+                wlog(f"API response: status={response.status} content-type={ctype} length={len(body)}")
+                log_chunks("API body preview", body, max_chunks=3)
 
-                    for item in items:
-                        if isinstance(item, dict):
-                            raw_symbol = item.get("symbol") or item.get("pair") or item.get("name") or item.get("symbolName", "")
-                            long_val = item.get("longRate") or item.get("longPercentage") or item.get("long") or item.get("longRatio", None)
-                            if raw_symbol and long_val is not None:
-                                cleaned = clean_symbol_key(raw_symbol)
-                                for sym in FASTBULL_SYMBOLS:
-                                    if clean_symbol_key(sym) == cleaned:
-                                        l_pct = float(long_val)
-                                        extracted_api_data[sym.upper()] = {
-                                            "long": l_pct,
-                                            "short": round(100.0 - l_pct, 1)
-                                        }
-        except Exception:
-            pass
+            data = json.loads(body)
+            found = {}
+            extract_pairs_from_json(data, found)
+            if found:
+                extracted_api_data.update(found)
+                wlog(f"API parsed: {len(found)} symbols (total {len(extracted_api_data)})")
+            elif "unparsed" not in logged_api:
+                logged_api.add("unparsed")
+                keys = list(data.keys())[:12] if isinstance(data, dict) else type(data).__name__
+                wlog(f"API JSON parsed but no symbol/long/short pairs recognised; top-level: {keys}")
+        except Exception as e:
+            wlog(f"API handler error: {str(e).splitlines()[0][:120]}")
 
     def route_handler(route):
         """Skip images/media/fonts and ad/analytics hosts: far less memory and load time."""
@@ -224,67 +295,34 @@ def fetch_fastbull_client_sentiment():
                 page.on("requestfailed", lambda r: net.__setitem__("failed", net["failed"] + 1))
 
                 try:
-                    resp = page.goto(url, wait_until="domcontentloaded", timeout=25000)
-                    wlog(f"page loaded (domcontentloaded), main status={resp.status if resp else None}")
+                    # 'commit' returns as soon as the server answers; the data call is read from the network,
+                    # so there is no need to wait for the (slow) page to finish building its DOM.
+                    resp = page.goto(url, wait_until="commit", timeout=25000)
+                    wlog(f"navigation committed, main status={resp.status if resp else None}")
                 except Exception as nav_err:
-                    wlog(f"navigation warning: {str(nav_err).splitlines()[0][:150]} -- inspecting page DOM anyway")
+                    wlog(f"navigation warning: {str(nav_err).splitlines()[0][:150]}")
 
-                try:
-                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                except Exception:
-                    pass
-
-                body_fail_streak = 0
-                renavigated = False
-                for attempt in range(1, 9):
-                    if time.time() > deadline:
-                        wlog("worker deadline reached -- stopping")
-                        break
-                    page.wait_for_timeout(2000)
+                while time.time() < deadline:
+                    page.wait_for_timeout(1000)
 
                     if len(extracted_api_data) >= 15:
                         wlog(f"Network intercept success: {len(extracted_api_data)} symbols from API")
-                        return extracted_api_data
+                        return dict(extracted_api_data)
 
-                    texts = []
-                    try:
-                        texts.append(page.inner_text("body", timeout=3000))
-                        body_fail_streak = 0
-                    except Exception as e:
-                        body_fail_streak += 1
-                        wlog(f"no page body yet (#{body_fail_streak}): {str(e).splitlines()[0][:80]}")
-                        if body_fail_streak == 3 and not renavigated:
-                            renavigated = True
-                            wlog("page looks stuck -- navigating again")
-                            try:
-                                resp = page.goto(url, wait_until="domcontentloaded", timeout=15000)
-                                wlog(f"re-navigation status={resp.status if resp else None}")
-                            except Exception as nav_err:
-                                wlog(f"re-navigation failed: {str(nav_err).splitlines()[0][:120]}")
-                        elif body_fail_streak >= 6:
-                            wlog("page never rendered -- giving up this attempt (a fresh browser will retry)")
-                            break
-
-                    merged = {**parse_sentiment_text("\n".join(texts)), **extracted_api_data}
-
-                    if len(merged) < 15:
-                        # Fallback: only same-site child frames (ad iframes are what made this slow before)
-                        for frame in page.frames:
-                            if frame.parent_frame is None or "fastbull" not in (frame.url or "").lower():
-                                continue
-                            try:
-                                texts.append(frame.locator("body").inner_text(timeout=1500))
-                            except Exception:
-                                continue
+                    # Late fallback: parse visible page text only if the API data hasn't shown up after 25s.
+                    if time.time() - t0 > 25:
+                        texts = []
+                        try:
+                            texts.append(page.inner_text("body", timeout=3000))
+                        except Exception as e:
+                            wlog(f"no page body yet: {str(e).splitlines()[0][:80]}")
                         merged = {**parse_sentiment_text("\n".join(texts)), **extracted_api_data}
-
-                    wlog(f"attempt {attempt}: api={len(extracted_api_data)} merged={len(merged)}")
-                    if len(merged) >= 15:
-                        wlog(f"Scrape success: {len(merged)} symbols")
-                        return merged
+                        if len(merged) >= 15:
+                            wlog(f"DOM fallback success: {len(merged)} symbols")
+                            return merged
 
                 wlog(f"net stats: responses={net['responses']} failed_requests={net['failed']} last_response={net['last_url']} page_url={page.url[:120]}")
-                wlog("0 usable symbols after maximum wait")
+                wlog(f"deadline reached with {len(extracted_api_data)} API symbols")
                 return None
             finally:
                 browser.close()
