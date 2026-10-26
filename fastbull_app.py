@@ -46,6 +46,19 @@ LEASE_TTL_SEC = 400           # cross-process lock; auto-expires if a holder die
 HOLDER_ID = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
 scrape_mutex = threading.Lock()
 
+# In-memory diagnostics, exposed at /health so a failing scrape explains itself.
+scrape_status = {
+    "last_attempt_utc": None,
+    "last_outcome": "no attempt yet",
+    "last_success_utc": None,
+    "last_worker_returncode": None,
+    "last_worker_output_tail": [],
+    "scheduler_loop_heartbeat_utc": None,
+}
+
+def set_status(**kw):
+    scrape_status.update(kw)
+
 # --- FULL 28-PAIR MATRIX + GOLD SYMBOL LIST ---
 FASTBULL_SYMBOLS = [
     # Majors (7)
@@ -312,10 +325,14 @@ def run_scrape_subprocess():
         except Exception:
             pass
         print(f"FastBull scrape exceeded {SCRAPE_TIMEOUT_SEC}s -- browser killed.")
+        set_status(last_worker_returncode="timeout", last_worker_output_tail=[])
         return None
 
+    lines = (out or "").splitlines()
+    set_status(last_worker_returncode=proc.returncode,
+               last_worker_output_tail=[l[:300] for l in lines[-12:]])
     result = None
-    for line in (out or "").splitlines():
+    for line in lines:
         if line.startswith(RESULT_MARKER):
             try:
                 result = json.loads(line[len(RESULT_MARKER):])
@@ -372,9 +389,17 @@ def execute_scrape_cycle():
     return None
 
 # --- CROSS-PROCESS LEASE (prevents duplicate browsers if several workers/instances run) ---
-def acquire_lease():
+def acquire_lease(force=False):
     now = datetime.datetime.now(datetime.timezone.utc)
     try:
+        if force:
+            # Startup after a deploy: any older lease belongs to the instance being replaced.
+            lock_collection.update_one(
+                {"_id": "scrape_lock"},
+                {"$set": {"holder": HOLDER_ID, "expires_at": now + datetime.timedelta(seconds=LEASE_TTL_SEC)}},
+                upsert=True
+            )
+            return True
         lock_collection.find_one_and_update(
             {"_id": "scrape_lock", "$or": [{"expires_at": {"$lt": now}}, {"holder": HOLDER_ID}]},
             {"$set": {"holder": HOLDER_ID, "expires_at": now + datetime.timedelta(seconds=LEASE_TTL_SEC)}},
@@ -397,36 +422,46 @@ def release_lease():
     except Exception:
         pass
 
-def run_scrape_guarded(scheduled=None):
+def run_scrape_guarded(scheduled=None, startup=False):
     """
     One scrape slot: single-flight, retried, market-hours aware.
+    startup=True (right after a deploy/restart) ignores any old lease and the slot de-duplication,
+    so a fresh scrape always happens immediately.
     Returns the symbols dict, or None (closed market / skipped / failed).
     """
+    set_status(last_attempt_utc=utc_now().isoformat())
     if not scrape_mutex.acquire(blocking=False):
         print("A scrape is already running in this process -- skipping.")
+        set_status(last_outcome="skipped: scrape already running in this process")
         return None
     try:
-        if not acquire_lease():
+        if not acquire_lease(force=startup):
             print("Another instance holds the scrape lease -- skipping.")
+            set_status(last_outcome="skipped: another instance holds the lease")
             return None
         try:
-            if scheduled is not None:
+            if scheduled is not None and not startup:
                 last_epoch = load_db_document(cache_collection).get("last_fetch_epoch", 0)
                 if last_epoch >= scheduled.timestamp():
                     print("This slot was already fetched by another worker -- skipping.")
+                    set_status(last_outcome="skipped: slot already fetched by another worker")
                     return None
 
             for attempt in range(1, MAX_ATTEMPTS_PER_SLOT + 1):
                 if is_market_closed(get_ny_time()):
                     print("Weekend pause: Forex market closed, skipping scrape cycle.")
+                    set_status(last_outcome="skipped: forex market closed (weekend pause)")
                     return None
                 symbols = execute_scrape_cycle()
                 if symbols:
+                    set_status(last_outcome=f"success: {len(symbols)} symbols",
+                               last_success_utc=utc_now().isoformat())
                     return symbols
                 if attempt < MAX_ATTEMPTS_PER_SLOT:
                     print(f"Scrape attempt {attempt}/{MAX_ATTEMPTS_PER_SLOT} returned nothing -- retrying in {RETRY_DELAY_SEC}s.")
                     time.sleep(RETRY_DELAY_SEC)
             print("All scrape attempts for this slot failed; waiting for next slot.")
+            set_status(last_outcome=f"failed: {MAX_ATTEMPTS_PER_SLOT} attempts returned no data")
             return None
         finally:
             release_lease()
@@ -453,14 +488,16 @@ def run_background_state_scheduler():
     """
     print("Executing immediate startup scrape cycle...")
     try:
-        run_scrape_guarded()
+        run_scrape_guarded(startup=True)
     except Exception as e:
         print(f"Startup Scrape Error: {str(e)}")
+        set_status(last_outcome=f"startup error: {e}")
 
     next_run = next_slot_after(utc_now())
     while True:
         try:
             now = utc_now()
+            set_status(scheduler_loop_heartbeat_utc=now.isoformat())
             if now >= next_run:
                 scheduled = next_run
                 lateness = (now - scheduled).total_seconds()
@@ -472,6 +509,7 @@ def run_background_state_scheduler():
                 next_run = next_slot_after(now if lateness > 60 else scheduled)
         except Exception as e:
             print(f"Scheduler Loop Error: {str(e)}")
+            set_status(last_outcome=f"scheduler error: {e}")
 
         sleep_for = (next_run - utc_now()).total_seconds()
         time.sleep(max(0.5, min(5.0, sleep_for)))
@@ -789,7 +827,8 @@ def health():
         "status": "ok",
         "last_fetch_time_ny": cached.get("last_fetch_time"),
         "seconds_since_last_fetch": round(time.time() - last_epoch) if last_epoch else None,
-        "scheduler_alive": bool(background_engine_thread and background_engine_thread.is_alive())
+        "scheduler_alive": bool(background_engine_thread and background_engine_thread.is_alive()),
+        "diagnostics": scrape_status
     })
 
 if WORKER_MODE:
