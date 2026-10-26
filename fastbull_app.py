@@ -4,8 +4,13 @@ import time
 import threading
 import re
 import json
+import sys
+import uuid
+import signal
+import subprocess
 from flask import Flask, jsonify, render_template_string
-from pymongo import MongoClient
+from pymongo import MongoClient, ReturnDocument
+from pymongo.errors import DuplicateKeyError
 from zoneinfo import ZoneInfo
 from playwright.sync_api import sync_playwright
 
@@ -15,13 +20,31 @@ app = Flask(__name__)
 MONGO_URI = os.environ.get('MONGO_URI', 'mongodb://localhost:27017/')
 
 # --- MONGO DATABASE CONFIGURATION ---
-client = MongoClient(MONGO_URI)
+# Short timeouts so a slow/unreachable DB can never freeze the scheduler thread.
+client = MongoClient(
+    MONGO_URI,
+    serverSelectionTimeoutMS=10000,
+    connectTimeoutMS=10000,
+    socketTimeoutMS=20000,
+)
 db = client["fastbull_sentiment_db"]
 
 baseline_collection = db["session_baselines"]
 daily_baseline_collection = db["daily_baselines"]
 cache_collection = db["api_cache"]
 chart_history_collection = db["session_chart_history"]
+lock_collection = db["scheduler_lock"]
+
+# --- SCRAPE SCHEDULING CONFIG ---
+WORKER_MODE = "--scrape-worker" in sys.argv   # child process that only runs the browser scrape
+RESULT_MARKER = "__SCRAPE_RESULT__:"
+SLOT_MINUTE_OFFSET = 1        # scrape at :01, :11, :21, :31, :41, :51
+SCRAPE_TIMEOUT_SEC = 100      # hard kill limit for one browser scrape
+MAX_ATTEMPTS_PER_SLOT = 3     # retries inside a slot if FastBull returns nothing
+RETRY_DELAY_SEC = 15
+LEASE_TTL_SEC = 400           # cross-process lock; auto-expires if a holder dies
+HOLDER_ID = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+scrape_mutex = threading.Lock()
 
 # --- FULL 28-PAIR MATRIX + GOLD SYMBOL LIST ---
 FASTBULL_SYMBOLS = [
@@ -147,6 +170,12 @@ def fetch_fastbull_client_sentiment():
                     user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
                 )
                 page.set_default_timeout(30000)
+                page.route(
+                    "**/*",
+                    lambda route: route.abort()
+                    if route.request.resource_type in ("image", "media", "font")
+                    else route.continue_()
+                )
                 page.on("response", handle_response)
 
                 try:
@@ -246,6 +275,56 @@ def record_chart_snapshot(symbols, current_session_label, current_date_str, ny_n
     except Exception as e:
         print(f"Chart Snapshot Error: {str(e)}")
 
+def is_market_closed(ny_now):
+    weekday = ny_now.weekday()
+    return (
+        weekday == 5 or
+        (weekday == 4 and ny_now.hour >= 17) or
+        (weekday == 6 and ny_now.hour < 17)
+    )
+
+def kill_process_tree(proc):
+    """Kills the worker AND the node/chromium children it spawned (no orphaned browsers)."""
+    try:
+        if hasattr(os, "killpg"):
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        else:
+            proc.kill()
+    except Exception:
+        pass
+
+def run_scrape_subprocess():
+    """
+    Runs the Playwright scrape in a separate process with a HARD timeout.
+    A hung browser can no longer freeze the scheduler: it is killed and the slot moves on.
+    """
+    cmd = [sys.executable, os.path.abspath(__file__), "--scrape-worker"]
+    kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.STDOUT, "text": True}
+    if hasattr(os, "setsid"):
+        kwargs["start_new_session"] = True
+    proc = subprocess.Popen(cmd, **kwargs)
+    try:
+        out, _ = proc.communicate(timeout=SCRAPE_TIMEOUT_SEC)
+    except subprocess.TimeoutExpired:
+        kill_process_tree(proc)
+        try:
+            proc.communicate(timeout=5)
+        except Exception:
+            pass
+        print(f"FastBull scrape exceeded {SCRAPE_TIMEOUT_SEC}s -- browser killed.")
+        return None
+
+    result = None
+    for line in (out or "").splitlines():
+        if line.startswith(RESULT_MARKER):
+            try:
+                result = json.loads(line[len(RESULT_MARKER):])
+            except ValueError:
+                result = None
+        elif line.strip():
+            print(f"[scrape-worker] {line}")
+    return result or None
+
 def execute_scrape_cycle():
     """Performs a single complete scrape, database update, and baseline set."""
     try:
@@ -253,22 +332,12 @@ def execute_scrape_cycle():
         current_date_str = ny_now.strftime("%Y-%m-%d")
         current_session_label, session_anchor_hour = get_current_session_details(ny_now)
 
-        weekday = ny_now.weekday()
-        market_closed_weekend = (
-            weekday == 5 or
-            (weekday == 4 and ny_now.hour >= 17) or
-            (weekday == 6 and ny_now.hour < 17)
-        )
-
-        if market_closed_weekend:
-            print("Weekend pause: Forex market closed, skipping scrape cycle.")
-            return None
-
-        symbols = fetch_fastbull_client_sentiment()
+        symbols = run_scrape_subprocess()
 
         if symbols:
             save_db_document(cache_collection, {
                 "last_fetch_time": ny_now.strftime("%Y-%m-%d %H:%M:%S"),
+                "last_fetch_epoch": ny_now.timestamp(),
                 "live_pairs": symbols
             }, "state_doc")
 
@@ -300,28 +369,112 @@ def execute_scrape_cycle():
             return symbols
     except Exception as e:
         print(f"Scrape Cycle Execution Error: {str(e)}")
+    return None
+
+# --- CROSS-PROCESS LEASE (prevents duplicate browsers if several workers/instances run) ---
+def acquire_lease():
+    now = datetime.datetime.now(datetime.timezone.utc)
+    try:
+        lock_collection.find_one_and_update(
+            {"_id": "scrape_lock", "$or": [{"expires_at": {"$lt": now}}, {"holder": HOLDER_ID}]},
+            {"$set": {"holder": HOLDER_ID, "expires_at": now + datetime.timedelta(seconds=LEASE_TTL_SEC)}},
+            upsert=True,
+            return_document=ReturnDocument.AFTER
+        )
+        return True
+    except DuplicateKeyError:
+        return False   # someone else holds a live lease
+    except Exception as e:
+        print(f"Lease Acquire Error: {str(e)}")
+        return False
+
+def release_lease():
+    try:
+        lock_collection.update_one(
+            {"_id": "scrape_lock", "holder": HOLDER_ID},
+            {"$set": {"expires_at": datetime.datetime.fromtimestamp(0, tz=datetime.timezone.utc)}}
+        )
+    except Exception:
+        pass
+
+def run_scrape_guarded(scheduled=None):
+    """
+    One scrape slot: single-flight, retried, market-hours aware.
+    Returns the symbols dict, or None (closed market / skipped / failed).
+    """
+    if not scrape_mutex.acquire(blocking=False):
+        print("A scrape is already running in this process -- skipping.")
         return None
+    try:
+        if not acquire_lease():
+            print("Another instance holds the scrape lease -- skipping.")
+            return None
+        try:
+            if scheduled is not None:
+                last_epoch = load_db_document(cache_collection).get("last_fetch_epoch", 0)
+                if last_epoch >= scheduled.timestamp():
+                    print("This slot was already fetched by another worker -- skipping.")
+                    return None
+
+            for attempt in range(1, MAX_ATTEMPTS_PER_SLOT + 1):
+                if is_market_closed(get_ny_time()):
+                    print("Weekend pause: Forex market closed, skipping scrape cycle.")
+                    return None
+                symbols = execute_scrape_cycle()
+                if symbols:
+                    return symbols
+                if attempt < MAX_ATTEMPTS_PER_SLOT:
+                    print(f"Scrape attempt {attempt}/{MAX_ATTEMPTS_PER_SLOT} returned nothing -- retrying in {RETRY_DELAY_SEC}s.")
+                    time.sleep(RETRY_DELAY_SEC)
+            print("All scrape attempts for this slot failed; waiting for next slot.")
+            return None
+        finally:
+            release_lease()
+    finally:
+        scrape_mutex.release()
 
 # --- BACKGROUND SCHEDULER WORKER ---
-def run_background_state_scheduler():
-    print("Executing immediate startup scrape cycle...")
-    execute_scrape_cycle()
+def utc_now():
+    return datetime.datetime.now(datetime.timezone.utc)
 
-    last_run_slot = None
+def next_slot_after(dt):
+    """Next :01/:11/:21/... boundary strictly after dt (UTC minutes align with NY: whole-hour offset)."""
+    base = dt.replace(second=0, microsecond=0)
+    cand = base + datetime.timedelta(minutes=(SLOT_MINUTE_OFFSET - base.minute) % 10)
+    if cand <= dt:
+        cand += datetime.timedelta(minutes=10)
+    return cand
+
+def run_background_state_scheduler():
+    """
+    Deadline-based loop: every slot is guaranteed to fire (no 60-second window to miss),
+    late wake-ups (host suspended/throttled) trigger an immediate catch-up scrape,
+    and a stuck scrape can't block the loop thanks to the subprocess hard timeout.
+    """
+    print("Executing immediate startup scrape cycle...")
+    try:
+        run_scrape_guarded()
+    except Exception as e:
+        print(f"Startup Scrape Error: {str(e)}")
+
+    next_run = next_slot_after(utc_now())
     while True:
         try:
-            ny_now = get_ny_time()
-            current_slot = f"{ny_now.strftime('%Y-%m-%d-%H')}-{ny_now.minute}"
-
-            # Run exactly at 1 minute past every 10-minute interval (:01, :11, :21, :31, :41, :51)
-            if ny_now.minute % 10 == 1 and current_slot != last_run_slot:
-                last_run_slot = current_slot
-                execute_scrape_cycle()
-
+            now = utc_now()
+            if now >= next_run:
+                scheduled = next_run
+                lateness = (now - scheduled).total_seconds()
+                if lateness > 60:
+                    print(f"Scheduler woke {int(lateness)}s late -- running catch-up scrape now.")
+                run_scrape_guarded(scheduled)
+                now = utc_now()
+                # After a late wake-up, don't replay every missed slot: one fresh scrape is enough.
+                next_run = next_slot_after(now if lateness > 60 else scheduled)
         except Exception as e:
             print(f"Scheduler Loop Error: {str(e)}")
-        
-        time.sleep(20)
+
+        sleep_for = (next_run - utc_now()).total_seconds()
+        time.sleep(max(0.5, min(5.0, sleep_for)))
 
 # --- THREAD CONTROL & LOCK ---
 background_engine_thread = None
@@ -339,7 +492,8 @@ def start_background_scheduler():
 def ensure_background_engine_running():
     start_background_scheduler()
 
-start_background_scheduler()
+if not WORKER_MODE:
+    start_background_scheduler()
 
 def process_sentiment_matrix():
     ny_now = get_ny_time()
@@ -616,7 +770,7 @@ def index():
 @app.route('/force-scrape')
 def force_scrape():
     """Debug route to manually trigger an immediate scrape from browser."""
-    symbols = execute_scrape_cycle()
+    symbols = run_scrape_guarded()
     if symbols:
         return jsonify({
             "status": "success",
@@ -625,6 +779,24 @@ def force_scrape():
             "data": symbols
         })
     return jsonify({"status": "failed", "count": 0}), 500
+
+@app.route('/health')
+def health():
+    """Lightweight status: also handy as an uptime-pinger target."""
+    cached = load_db_document(cache_collection)
+    last_epoch = cached.get("last_fetch_epoch")
+    return jsonify({
+        "status": "ok",
+        "last_fetch_time_ny": cached.get("last_fetch_time"),
+        "seconds_since_last_fetch": round(time.time() - last_epoch) if last_epoch else None,
+        "scheduler_alive": bool(background_engine_thread and background_engine_thread.is_alive())
+    })
+
+if WORKER_MODE:
+    # Child-process entry point: scrape once, emit JSON on a marker line, exit.
+    _result = fetch_fastbull_client_sentiment()
+    print(RESULT_MARKER + json.dumps(_result), flush=True)
+    sys.exit(0)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
