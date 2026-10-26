@@ -39,8 +39,9 @@ lock_collection = db["scheduler_lock"]
 WORKER_MODE = "--scrape-worker" in sys.argv   # child process that only runs the browser scrape
 RESULT_MARKER = "__SCRAPE_RESULT__:"
 SLOT_MINUTE_OFFSET = 1        # scrape at :01, :11, :21, :31, :41, :51
-SCRAPE_TIMEOUT_SEC = 100      # hard kill limit for one browser scrape
-MAX_ATTEMPTS_PER_SLOT = 3     # retries inside a slot if FastBull returns nothing
+SCRAPE_TIMEOUT_SEC = 110      # hard kill limit for one browser scrape
+WORKER_DEADLINE_SEC = 85      # the browser worker stops polling by itself after this
+MAX_ATTEMPTS_PER_SLOT = 2     # retries inside a slot if FastBull returns nothing
 RETRY_DELAY_SEC = 15
 LEASE_TTL_SEC = 400           # cross-process lock; auto-expires if a holder dies
 HOLDER_ID = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
@@ -130,14 +131,26 @@ def parse_sentiment_text(text):
             results[std_key] = {"long": long_pct, "short": round(100.0 - long_pct, 1)}
     return results
 
+BLOCKED_URL_PARTS = (
+    "doubleclick", "googlesyndication", "google-analytics", "googletagmanager", "googleadservices",
+    "adservice", "facebook.net", "facebook.com/tr", "hotjar", "clarity.ms", "taboola", "outbrain",
+    "criteo", "adsystem", "amazon-adsystem", "scorecardresearch", "yandex", "analytics",
+)
+
 def fetch_fastbull_client_sentiment():
     """
-    Renders FastBull speculative sentiment page using Playwright.
+    Renders FastBull speculative sentiment page using Playwright (runs inside the scrape-worker process).
     Target URL: https://www.fastbull.com/speculative-sentiment?textType=1&id=-1
-    Intercepts network requests to extract raw API JSON directly.
+    Intercepts network requests to extract raw API JSON directly, falls back to page text.
+    Every step is logged with elapsed time so a slow/hanging step is visible in /health.
     """
     url = "https://www.fastbull.com/speculative-sentiment?textType=1&id=-1"
     extracted_api_data = {}
+    t0 = time.time()
+    deadline = t0 + WORKER_DEADLINE_SEC
+
+    def wlog(msg):
+        print(f"[{time.time() - t0:5.1f}s] {msg}", flush=True)
 
     def handle_response(response):
         """Intercepts FastBull internal backend API payloads."""
@@ -146,13 +159,13 @@ def fetch_fastbull_client_sentiment():
                 content_type = response.headers.get("content-type", "")
                 if "json" in content_type:
                     data = response.json()
-                    
+
                     items = []
                     if isinstance(data, dict):
                         items = data.get("data", []) or data.get("list", []) or data.get("result", [])
                     elif isinstance(data, list):
                         items = data
-                        
+
                     if isinstance(items, dict):
                         items = items.get("list", []) or items.get("items", [])
 
@@ -172,61 +185,87 @@ def fetch_fastbull_client_sentiment():
         except Exception:
             pass
 
+    def route_handler(route):
+        """Skip images/media/fonts and ad/analytics hosts: far less memory and load time."""
+        try:
+            req = route.request
+            u = req.url.lower()
+            if req.resource_type in ("image", "media", "font") or any(b in u for b in BLOCKED_URL_PARTS):
+                route.abort()
+            else:
+                route.continue_()
+        except Exception:
+            pass
+
     try:
         with sync_playwright() as p:
+            wlog("playwright started")
             browser = p.chromium.launch(
                 headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+                      "--no-zygote", "--disable-extensions", "--disable-background-networking",
+                      "--mute-audio"]
             )
+            wlog("browser launched")
             try:
                 page = browser.new_page(
                     user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
                 )
-                page.set_default_timeout(30000)
-                page.route(
-                    "**/*",
-                    lambda route: route.abort()
-                    if route.request.resource_type in ("image", "media", "font")
-                    else route.continue_()
-                )
+                page.set_default_timeout(20000)
+                page.route("**/*", route_handler)
                 page.on("response", handle_response)
 
                 try:
-                    page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                    page.goto(url, wait_until="domcontentloaded", timeout=25000)
+                    wlog("page loaded (domcontentloaded)")
                 except Exception as nav_err:
-                    print(f"FastBull Navigation Warning: {str(nav_err)} -- inspecting page DOM anyway")
+                    wlog(f"navigation warning: {str(nav_err)[:200]} -- inspecting page DOM anyway")
 
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                try:
+                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                except Exception:
+                    pass
 
-                for attempt in range(8):
-                    page.wait_for_timeout(2500)
-                    
+                for attempt in range(1, 9):
+                    if time.time() > deadline:
+                        wlog("worker deadline reached -- stopping")
+                        break
+                    page.wait_for_timeout(2000)
+
                     if len(extracted_api_data) >= 15:
-                        print(f"FastBull Network Intercept Success: Captured {len(extracted_api_data)} symbols directly from API.")
+                        wlog(f"Network intercept success: {len(extracted_api_data)} symbols from API")
                         return extracted_api_data
 
-                    combined_text = ""
-                    for frame in page.frames:
-                        try:
-                            txt = frame.locator("body").inner_text(timeout=2000)
-                            if txt:
-                                combined_text += "\n" + txt
-                        except Exception:
-                            continue
+                    texts = []
+                    try:
+                        texts.append(page.inner_text("body", timeout=3000))
+                    except Exception as e:
+                        wlog(f"main body text error: {str(e)[:120]}")
 
-                    results = parse_sentiment_text(combined_text)
-                    merged = {**results, **extracted_api_data}
-                    
+                    merged = {**parse_sentiment_text("\n".join(texts)), **extracted_api_data}
+
+                    if len(merged) < 15:
+                        # Fallback: only same-site child frames (ad iframes are what made this slow before)
+                        for frame in page.frames:
+                            if frame.parent_frame is None or "fastbull" not in (frame.url or "").lower():
+                                continue
+                            try:
+                                texts.append(frame.locator("body").inner_text(timeout=1500))
+                            except Exception:
+                                continue
+                        merged = {**parse_sentiment_text("\n".join(texts)), **extracted_api_data}
+
+                    wlog(f"attempt {attempt}: api={len(extracted_api_data)} merged={len(merged)}")
                     if len(merged) >= 15:
-                        print(f"FastBull Scrape Success: Parsed {len(merged)} distinct symbols on attempt {attempt + 1}.")
+                        wlog(f"Scrape success: {len(merged)} symbols")
                         return merged
 
-                print("FastBull Scrape Warning: 0 symbols parsed across all frames after maximum wait.")
+                wlog("0 usable symbols after maximum wait")
                 return None
             finally:
                 browser.close()
     except Exception as e:
-        print(f"FastBull Playwright Exception: {str(e)}")
+        wlog(f"Playwright exception: {str(e)[:300]}")
         return None
 
 def record_chart_snapshot(symbols, current_session_label, current_date_str, ny_now):
@@ -320,12 +359,14 @@ def run_scrape_subprocess():
         out, _ = proc.communicate(timeout=SCRAPE_TIMEOUT_SEC)
     except subprocess.TimeoutExpired:
         kill_process_tree(proc)
+        partial = ""
         try:
-            proc.communicate(timeout=5)
+            partial, _ = proc.communicate(timeout=5)
         except Exception:
             pass
-        print(f"FastBull scrape exceeded {SCRAPE_TIMEOUT_SEC}s -- browser killed.")
-        set_status(last_worker_returncode="timeout", last_worker_output_tail=[])
+        tail = [l[:300] for l in (partial or "").splitlines()[-15:]]
+        print(f"FastBull scrape exceeded {SCRAPE_TIMEOUT_SEC}s -- browser killed. Last worker output: {tail}")
+        set_status(last_worker_returncode="timeout", last_worker_output_tail=tail)
         return None
 
     lines = (out or "").splitlines()
@@ -487,6 +528,7 @@ def run_background_state_scheduler():
     and a stuck scrape can't block the loop thanks to the subprocess hard timeout.
     """
     print("Executing immediate startup scrape cycle...")
+    set_status(scheduler_loop_heartbeat_utc=utc_now().isoformat())
     try:
         run_scrape_guarded(startup=True)
     except Exception as e:
