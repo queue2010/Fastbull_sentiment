@@ -39,10 +39,10 @@ lock_collection = db["scheduler_lock"]
 WORKER_MODE = "--scrape-worker" in sys.argv   # child process that only runs the browser scrape
 RESULT_MARKER = "__SCRAPE_RESULT__:"
 SLOT_MINUTE_OFFSET = 1        # scrape at :01, :11, :21, :31, :41, :51
-SCRAPE_TIMEOUT_SEC = 110      # hard kill limit for one browser scrape
-WORKER_DEADLINE_SEC = 85      # the browser worker stops polling by itself after this
-MAX_ATTEMPTS_PER_SLOT = 2     # retries inside a slot if FastBull returns nothing
-RETRY_DELAY_SEC = 15
+SCRAPE_TIMEOUT_SEC = 70       # hard kill limit for one browser scrape
+WORKER_DEADLINE_SEC = 50      # the browser worker stops polling by itself after this
+MAX_ATTEMPTS_PER_SLOT = 3     # retries inside a slot if FastBull returns nothing
+RETRY_DELAY_SEC = 5
 LEASE_TTL_SEC = 400           # cross-process lock; auto-expires if a holder dies
 HOLDER_ID = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
 scrape_mutex = threading.Lock()
@@ -134,7 +134,7 @@ def parse_sentiment_text(text):
 BLOCKED_URL_PARTS = (
     "doubleclick", "googlesyndication", "google-analytics", "googletagmanager", "googleadservices",
     "adservice", "facebook.net", "facebook.com/tr", "hotjar", "clarity.ms", "taboola", "outbrain",
-    "criteo", "adsystem", "amazon-adsystem", "scorecardresearch", "yandex", "analytics",
+    "criteo", "adsystem", "amazon-adsystem", "scorecardresearch",
 )
 
 def fetch_fastbull_client_sentiment():
@@ -148,6 +148,8 @@ def fetch_fastbull_client_sentiment():
     extracted_api_data = {}
     t0 = time.time()
     deadline = t0 + WORKER_DEADLINE_SEC
+    net = {"responses": 0, "failed": 0, "last_url": ""}
+    logged_api = set()
 
     def wlog(msg):
         print(f"[{time.time() - t0:5.1f}s] {msg}", flush=True)
@@ -155,9 +157,14 @@ def fetch_fastbull_client_sentiment():
     def handle_response(response):
         """Intercepts FastBull internal backend API payloads."""
         try:
+            net["responses"] += 1
+            net["last_url"] = response.url[:150]
             if any(k in response.url.lower() for k in ["sentiment", "speculative"]) and response.status == 200:
                 content_type = response.headers.get("content-type", "")
                 if "json" in content_type:
+                    if response.url not in logged_api:
+                        logged_api.add(response.url)
+                        wlog(f"API candidate: {response.url[:200]}")
                     data = response.json()
 
                     items = []
@@ -214,18 +221,21 @@ def fetch_fastbull_client_sentiment():
                 page.set_default_timeout(20000)
                 page.route("**/*", route_handler)
                 page.on("response", handle_response)
+                page.on("requestfailed", lambda r: net.__setitem__("failed", net["failed"] + 1))
 
                 try:
-                    page.goto(url, wait_until="domcontentloaded", timeout=25000)
-                    wlog("page loaded (domcontentloaded)")
+                    resp = page.goto(url, wait_until="domcontentloaded", timeout=25000)
+                    wlog(f"page loaded (domcontentloaded), main status={resp.status if resp else None}")
                 except Exception as nav_err:
-                    wlog(f"navigation warning: {str(nav_err)[:200]} -- inspecting page DOM anyway")
+                    wlog(f"navigation warning: {str(nav_err).splitlines()[0][:150]} -- inspecting page DOM anyway")
 
                 try:
                     page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 except Exception:
                     pass
 
+                body_fail_streak = 0
+                renavigated = False
                 for attempt in range(1, 9):
                     if time.time() > deadline:
                         wlog("worker deadline reached -- stopping")
@@ -239,8 +249,21 @@ def fetch_fastbull_client_sentiment():
                     texts = []
                     try:
                         texts.append(page.inner_text("body", timeout=3000))
+                        body_fail_streak = 0
                     except Exception as e:
-                        wlog(f"main body text error: {str(e)[:120]}")
+                        body_fail_streak += 1
+                        wlog(f"no page body yet (#{body_fail_streak}): {str(e).splitlines()[0][:80]}")
+                        if body_fail_streak == 3 and not renavigated:
+                            renavigated = True
+                            wlog("page looks stuck -- navigating again")
+                            try:
+                                resp = page.goto(url, wait_until="domcontentloaded", timeout=15000)
+                                wlog(f"re-navigation status={resp.status if resp else None}")
+                            except Exception as nav_err:
+                                wlog(f"re-navigation failed: {str(nav_err).splitlines()[0][:120]}")
+                        elif body_fail_streak >= 6:
+                            wlog("page never rendered -- giving up this attempt (a fresh browser will retry)")
+                            break
 
                     merged = {**parse_sentiment_text("\n".join(texts)), **extracted_api_data}
 
@@ -260,6 +283,7 @@ def fetch_fastbull_client_sentiment():
                         wlog(f"Scrape success: {len(merged)} symbols")
                         return merged
 
+                wlog(f"net stats: responses={net['responses']} failed_requests={net['failed']} last_response={net['last_url']} page_url={page.url[:120]}")
                 wlog("0 usable symbols after maximum wait")
                 return None
             finally:
@@ -364,14 +388,14 @@ def run_scrape_subprocess():
             partial, _ = proc.communicate(timeout=5)
         except Exception:
             pass
-        tail = [l[:300] for l in (partial or "").splitlines()[-15:]]
+        tail = [l[:300] for l in (partial or "").splitlines()[-25:]]
         print(f"FastBull scrape exceeded {SCRAPE_TIMEOUT_SEC}s -- browser killed. Last worker output: {tail}")
         set_status(last_worker_returncode="timeout", last_worker_output_tail=tail)
         return None
 
     lines = (out or "").splitlines()
     set_status(last_worker_returncode=proc.returncode,
-               last_worker_output_tail=[l[:300] for l in lines[-12:]])
+               last_worker_output_tail=[l[:300] for l in lines[-25:]])
     result = None
     for line in lines:
         if line.startswith(RESULT_MARKER):
